@@ -188,7 +188,7 @@ if __name__ == "__main__":
     model = train_model(full_df[features], full_df['label'])
 
     # Сохранение модели
-    joblib.dump(model, "forex_model.pkl")
+    joblib.dump(model, "ds_forex_model.pkl")
     print("\nМодель успешно обучена и сохранена в forex_model.pkl")
 
     # Сохранение данных для анализа

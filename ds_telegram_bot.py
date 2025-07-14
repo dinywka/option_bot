@@ -18,7 +18,7 @@ ATR_MULTIPLIER = 3.0
 
 # Инициализация бота
 bot = telegram.Bot(token=TOKEN)
-model = joblib.load("forex_model.pkl")
+model = joblib.load("ds_forex_model.pkl")
 
 
 def get_current_data(pair):

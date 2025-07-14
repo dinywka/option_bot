@@ -1,93 +1,105 @@
 import os
-import requests
-import numpy as np
-import pandas as pd
-import yfinance as yf
-from dotenv import load_dotenv
-from datetime import datetime, timedelta
-from sklearn.ensemble import GradientBoostingClassifier
+import time
 import joblib
+import requests
+import yfinance as yf
+import pandas as pd
+from tqdm import tqdm
+from ta.momentum import RSIIndicator
+from ta.trend import MACD, EMAIndicator
+from ta.volatility import BollingerBands
+from dotenv import load_dotenv
+from datetime import datetime
 
-PAIRS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X"]
-LOOKAHEAD = 4
-TP_RATIO = 0.004
-SL_RATIO = 0.002
-N_HOURS = 500
-FEATURES = ["rsi", "macd"]
-
+# Загрузка переменных окружения
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-def send_signal(pair, direction, entry, sl, tp, entry_time):
-    exit_time = datetime.strptime(entry_time, "%Y-%m-%d %H:%M") + timedelta(hours=LOOKAHEAD)
-    msg = f"""🚀 Торговый сигнал 🚀
+# Константы
+PAIRS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X"]
+FEATURES = ["rsi", "macd", "ema_10", "ema_20", "bb_high", "bb_low", "volume_ema"]
+LOOKAHEAD = 4
+COMMISSION = 0.0002
+LIMIT_ROWS = 1000
 
-Пара: {pair}
-Направление: {direction}
-Цена входа: {entry}
-Стоп-лосс: {sl}
-Тейк-профит: {tp}
-
-Время входа: {entry_time}
-Время выхода: {exit_time.strftime("%Y-%m-%d %H:%M")} (через {LOOKAHEAD} ч)
-"""
+def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    try:
+        requests.post(url, data=payload)
+    except Exception as e:
+        print("Ошибка отправки в Telegram:", e)
+
+def download_data(symbol):
+    df = yf.download(symbol, period="30d", interval="1h", progress=False)
+    df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    df.columns = ["open", "high", "low", "close", "volume"]
+    df.reset_index(inplace=True)
+    df.rename(columns={"Datetime": "timestamp"}, inplace=True)
+    return df.tail(LIMIT_ROWS)
 
 def add_indicators(df):
-    df["rsi"] = df["close"].diff().rolling(14).apply(
-        lambda x: 100 - 100 / (1 + (x[x > 0].mean() / (-x[x < 0].mean() + 1e-6))), raw=False)
-    df["ema"] = df["close"].ewm(span=12).mean()
-    df["signal"] = df["close"].ewm(span=26).mean()
-    df["macd"] = df["ema"] - df["signal"]
-    return df.dropna()
+    df["rsi"] = RSIIndicator(df["close"]).rsi()
+    df["macd"] = MACD(df["close"]).macd_diff()
+    df["ema_10"] = EMAIndicator(df["close"], window=10).ema_indicator()
+    df["ema_20"] = EMAIndicator(df["close"], window=20).ema_indicator()
+    bb = BollingerBands(df["close"])
+    df["bb_high"] = bb.bollinger_hband()
+    df["bb_low"] = bb.bollinger_lband()
+    df["volume_ema"] = df["volume"].ewm(span=14).mean()
+    return df
 
+# Загрузка модели
 model = joblib.load("forex_model.pkl")
 
-best_signal = None
-best_score = 0
-
-for pair in PAIRS:
-    df = yf.download(pair, interval="1h", period=f"{int(N_HOURS/24)+5}d")
-    if len(df) < LOOKAHEAD + 10:
-        continue
-    df = df.reset_index()
-    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
-    df = df[["datetime", "open", "high", "low", "close", "volume"]]
-    df = add_indicators(df).reset_index(drop=True)
-
-    for i in range(len(df) - LOOKAHEAD):
-        row = df.iloc[i]
+def run_signal_bot():
+    for pair in PAIRS:
+        df = download_data(pair)
+        df = add_indicators(df)
+        df.dropna(inplace=True)
+        row = df.iloc[-LOOKAHEAD]  # последний вход перед будущей ценой
         X = row[FEATURES].values.reshape(1, -1)
-        try:
-            proba = model.predict_proba(X)[0]
-        except:
-            continue
-        buy_score = proba[2]
-        if buy_score > best_score:
-            entry_price = row["close"]
-            entry_time = row["datetime"].strftime("%Y-%m-%d %H:%M")
-            sl = entry_price * (1 - SL_RATIO)
-            tp = entry_price * (1 + TP_RATIO)
-            best_signal = {
-                "pair": pair.replace("=X", ""),
-                "entry": f"{entry_price:.5f}",
-                "sl": f"{sl:.5f}",
-                "tp": f"{tp:.5f}",
-                "time": entry_time,
-                "direction": "BUY"
-            }
-            best_score = buy_score
 
-if best_signal:
-    send_signal(
-        pair=best_signal["pair"],
-        direction=best_signal["direction"],
-        entry=best_signal["entry"],
-        sl=best_signal["sl"],
-        tp=best_signal["tp"],
-        entry_time=best_signal["time"]
-    )
-else:
-    print("⚠️ Сегодня сигналов не найдено.")
+        try:
+            pred = model.predict(X)[0]
+        except Exception as e:
+            print(f"Ошибка в модели для {pair}: {e}")
+            continue
+
+        if pred == 0:
+            continue  # Пропускаем, если нет сигнала
+
+        direction = "BUY" if pred == 1 else "SELL"
+        entry = row["close"]
+
+        # SL и TP можно настраивать как соотношение 1:2
+        sl_pips = 0.0025 if "JPY" not in pair else 0.25
+        tp_pips = sl_pips * 2
+
+        sl = entry - sl_pips if direction == "BUY" else entry + sl_pips
+        tp = entry + tp_pips if direction == "BUY" else entry - tp_pips
+
+        message = (
+            f"🚀 <b>Торговый сигнал</b> 🚀\n\n"
+            f"Пара: <b>{pair.replace('=X', '')}</b>\n"
+            f"Направление: <b>{direction}</b>\n"
+            f"Цена входа: <b>{entry:.5f}</b>\n"
+            f"Стоп-лосс: <b>{sl:.5f}</b>\n"
+            f"Тейк-профит: <b>{tp:.5f}</b>\n\n"
+            f"Время: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC\n"
+            f"#Forex #Trading #Signals"
+        )
+        send_telegram_message(message)
+        print("✅ Сигнал отправлен:", message)
+
+# Запуск каждый час
+if __name__ == "__main__":
+    while True:
+        print(f"⏰ Запуск проверки сигналов — {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
+        run_signal_bot()
+        time.sleep(3600)  # Ждем 1 час
