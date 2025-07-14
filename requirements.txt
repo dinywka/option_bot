@@ -1,0 +1,4 @@
+python-dotenv
+requests
+pandas
+pybit==5.11.0
