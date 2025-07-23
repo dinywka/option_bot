@@ -1,4 +1,6 @@
-python-dotenv
-requests
-pandas
-pybit==5.11.0
+python-telegram-bot==20.3
+pybit>=3.0.0
+pandas==2.0.3
+numpy==1.24.4
+TA-Lib==0.4.26
+python-dotenv==1.0.0
