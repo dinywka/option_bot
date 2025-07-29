@@ -9,6 +9,9 @@ from connectors.bybit_connector import BybitConnector
 from strategies.enhanced_sr import EnhancedSRStrategy
 from config.settings import SYMBOLS, RISK_PERCENT, LEVERAGE
 from config.paths import LOG_DIR
+from config.settings import MIN_QTY
+from datetime import datetime
+
 
 
 class TradingBot:
@@ -43,6 +46,9 @@ class TradingBot:
         except Exception as e:
             self.logger.error(f"Telegram error: {str(e)}")
 
+    async def send_message(self, text: str):
+        await self.send_telegram(text)
+
     async def get_account_balance(self):
         balance = await self.connector.get_wallet_balance()
         self.logger.info(f"Current balance: {balance}")
@@ -54,6 +60,7 @@ class TradingBot:
 
     def calculate_position_size(self, price: float) -> float:
         if not self.start_balance:
+            self.logger.warning("Start balance is None!")
             return 0.0
         risk_amount = self.start_balance * (RISK_PERCENT / 100)
         return risk_amount / price
@@ -70,30 +77,57 @@ class TradingBot:
             if trade:
                 await self.place_order(symbol, trade)
 
+
     async def place_order(self, symbol: str, trade: dict):
         try:
             direction = trade["signal"]
             sl = trade["sl"]
             tp = trade["tp"]
+            entry_price = trade["entry"]
 
-            price_data = await self.connector.get_last_price(symbol)
-            entry_price = float(price_data['last_price'])
-            qty = self.calculate_position_size(entry_price)
+            qty = max(self.calculate_position_size(entry_price), MIN_QTY.get(symbol, 0.001))
+            self.logger.info(f"💰 Расчёт позиции: qty={qty}, entry={entry_price}, balance={self.start_balance}")
 
             if qty <= 0:
                 self.logger.warning(f"Zero quantity for {symbol}")
                 return
 
-            order = await self.connector.place_order({
+            order_params = {
                 'category': 'linear',
                 'symbol': symbol,
                 'side': 'Buy' if direction == 'BUY' else 'Sell',
                 'orderType': 'Market',
                 'qty': round(qty, 3),
                 'leverage': LEVERAGE
-            })
+            }
 
-            self.logger.info(f"Order executed: {order}")
+            self.logger.info(f"📤 Отправка ордера: {order_params}")
+            order = await self.connector.place_order(order_params)
+
+
+            if order is None or order.get("retCode") != 0:
+                err_msg = order.get('retMsg') if order else "None response"
+                self.logger.error(f"❌ Ошибка размещения ордера: {err_msg}")
+                await self.send_telegram(f"❌ Ордер не размещён: {err_msg}")
+                return
+
+            order_id = order.get("result", {}).get("orderId")
+            time_now = datetime.utcnow().strftime("%H:%M:%S")
+
+            if order_id:
+                await asyncio.sleep(1.5)
+                status = self.connector.get_order_status(symbol, order_id)
+
+                if status != "Filled":
+                    self.logger.warning(f"⚠️ Ордер {order_id} не исполнен! Статус: {status}")
+                    await self.send_message(f"{time_now}\n⚠️ Ордер не исполнен: статус {status}")
+                else:
+                    self.logger.info(f"✅ Ордер исполнен: {order_id}")
+                    await self.send_message(f"{time_now}\n✅ Ордер исполнен: {order_id}")
+            else:
+                self.logger.error("❌ Не удалось получить order_id от Bybit!")
+                await self.send_message(f"{time_now}\n❌ Ошибка при размещении ордера")
+
             await self.send_telegram(
                 f"📥 <b>{symbol} {direction}</b>\n"
                 f"Entry: {entry_price:.2f}\n"
@@ -109,7 +143,7 @@ class TradingBot:
             }
 
         except Exception as e:
-            self.logger.error(f"Order failed: {str(e)}")
+            self.logger.error(f"❌ Order failed: {str(e)}")
             await self.send_telegram(f"❌ Order error: {str(e)}")
 
     async def check_positions(self):

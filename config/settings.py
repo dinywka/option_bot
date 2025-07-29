@@ -25,3 +25,11 @@ MODEL_DIR = BASE_DIR / "models"
 # Параметры AI (если используется)
 USE_AI = os.getenv("USE_AI", "false").lower() == "true"
 AI_MODEL_NAME = os.getenv("AI_MODEL_NAME", "lstm_volatility.h5")
+
+MIN_QTY = {
+    "BTCUSDT": 0.001,
+    "ETHUSDT": 0.01,
+    "XRPUSDT": 5,
+    "BNBUSDT": 0.1,
+    "SOLUSDT": 0.1
+}

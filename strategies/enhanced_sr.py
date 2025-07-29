@@ -325,17 +325,26 @@ class EnhancedSRStrategy(BaseStrategy):
         signal = self.analyze(df)
         sl = None
         tp = None
+        reward_ratio = 1.6
 
         if signal == "BUY":
             sl = support
-            risk_pct = abs((last_close - sl) / last_close)
-            tp = last_close + (last_close - sl) * 1.6
+            if sl >= last_close:  # ❌ стоп выше входа, нелогично
+                return {"stop_loss": None, "take_profit": None, "risk_pct": 0.0}
+            risk = last_close - sl
+            tp = last_close + risk * reward_ratio
+
         elif signal == "SELL":
             sl = resistance
-            risk_pct = abs((sl - last_close) / last_close)
-            tp = last_close - (sl - last_close) * 1.6
+            if sl <= last_close:  # ❌ стоп ниже входа, нелогично
+                return {"stop_loss": None, "take_profit": None, "risk_pct": 0.0}
+            risk = sl - last_close
+            tp = last_close - risk * reward_ratio
+
         else:
             return {"stop_loss": None, "take_profit": None, "risk_pct": 0.0}
+
+        risk_pct = risk / last_close
 
         return {
             "stop_loss": round(sl, 2),
@@ -343,16 +352,23 @@ class EnhancedSRStrategy(BaseStrategy):
             "risk_pct": round(risk_pct, 4)
         }
 
-    def calculate_stop_loss_take_profit(self, df, direction, entry_price, window=20, sl_buffer=0.001, tp_multiplier=1.6):
+    def calculate_stop_loss_take_profit(self, df, direction, entry_price, window=20, sl_buffer=0.001,
+                                        tp_multiplier=1.6):
         recent = df.iloc[-window:]
 
         if direction == 'long':
             sl_level = recent['low'].min() - sl_buffer * entry_price
+            if sl_level >= entry_price:
+                self.logger.info("❌ SL выше Entry при LONG — сигнал отменён")
+                return None, None
             sl_distance = entry_price - sl_level
             tp_level = entry_price + sl_distance * tp_multiplier
 
         elif direction == 'short':
             sl_level = recent['high'].max() + sl_buffer * entry_price
+            if sl_level <= entry_price:
+                self.logger.info("❌ SL ниже Entry при SHORT — сигнал отменён")
+                return None, None
             sl_distance = sl_level - entry_price
             tp_level = entry_price - sl_distance * tp_multiplier
 
