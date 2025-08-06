@@ -464,73 +464,95 @@ class TradingBot:
                 self.api_errors[symbol] = self.api_errors.get(symbol, 0) + 1
                 await asyncio.sleep(5)
 
-    async def place_protective_orders(self, symbol: str, side: str, entry_price: float, sl_price: float,
-                                      tp_price: float, qty: float):
-        """Размещает стоп-лосс и тейк-профит как лимитные ордера"""
+    async def get_safe_market_price(self, symbol: str, side: str, entry_price: float):
+        """Использует цену входа из сигнала с небольшим буфером для безопасности"""
         try:
-            # Определяем противоположную сторону для закрытия позиции
-            close_side = "Sell" if side == "Buy" else "Buy"
+            # Добавляем буфер для безопасности
+            if side == "Buy":
+                # Для покупки берем цену чуть выше цены входа
+                safe_price = entry_price * 1.002  # +0.2%
+            else:
+                # Для продажи берем цену чуть ниже цены входа
+                safe_price = entry_price * 0.998  # -0.2%
 
-            sl_success = False
-            tp_success = False
-
-            # 1. Размещаем стоп-лосс как лимитный ордер
-            try:
-                sl_order = {
-                    "category": "linear",
-                    "symbol": symbol,
-                    "side": close_side,
-                    "orderType": "Limit",
-                    "qty": str(qty),
-                    "price": str(sl_price),
-                    "reduceOnly": True,
-                    "timeInForce": "GTC"  # Good Till Cancelled
-                }
-
-                sl_response = await self.place_order_with_retry(sl_order, symbol)
-                if sl_response:
-                    self.logger.info(f"✅ Stop-Loss (Limit) размещен для {symbol}: {sl_price}")
-                    sl_success = True
-                else:
-                    self.logger.error(f"❌ Ошибка размещения Stop-Loss для {symbol}")
-
-            except Exception as e:
-                self.logger.error(f"❌ Исключение при размещении Stop-Loss для {symbol}: {e}")
-
-            # Небольшая пауза между ордерами
-            await asyncio.sleep(0.5)
-
-            # 2. Размещаем тейк-профит как лимитный ордер
-            try:
-                tp_order = {
-                    "category": "linear",
-                    "symbol": symbol,
-                    "side": close_side,
-                    "orderType": "Limit",
-                    "qty": str(qty),
-                    "price": str(tp_price),
-                    "reduceOnly": True,
-                    "timeInForce": "GTC"
-                }
-
-                tp_response = await self.place_order_with_retry(tp_order, symbol)
-                if tp_response:
-                    self.logger.info(f"✅ Take-Profit (Limit) размещен для {symbol}: {tp_price}")
-                    tp_success = True
-                else:
-                    self.logger.error(f"❌ Ошибка размещения Take-Profit для {symbol}")
-
-            except Exception as e:
-                self.logger.error(f"❌ Исключение при размещении Take-Profit для {symbol}: {e}")
-
-            return sl_success and tp_success
+            safe_price = round(safe_price, 2)  # Округляем до 2 знаков для SOL
+            self.logger.info(f"💰 Безопасная цена для {symbol} ({side}): {entry_price} → {safe_price}")
+            return safe_price
 
         except Exception as e:
-            self.logger.error(f"❌ Общая ошибка размещения защитных ордеров для {symbol}: {e}")
-            return False
+            self.logger.error(f"❌ Ошибка расчета безопасной цены для {symbol}: {e}")
+            return None
 
+    # ИСПРАВЛЕНИЕ 4: Улучшенная функция place_order_with_retry (ИДЕТ ПЕРВОЙ)
+    async def place_order_with_retry(self, order_params: dict, symbol: str, max_retries: int = 3) -> dict:
+        """Размещение ордера с экспоненциальным бэкоффом"""
+        for attempt in range(max_retries):
+            try:
+                order = await self.connector.place_order(order_params)
+
+                if order is None:
+                    self.api_errors[symbol] = self.api_errors.get(symbol, 0) + 1
+                    error_count = self.api_errors[symbol]
+
+                    self.logger.error(f"❌ Получен None ответ от Bybit для {symbol} (ошибка #{error_count})")
+
+                    if attempt < max_retries - 1:
+                        # Экспоненциальная задержка: 1s, 2s, 4s
+                        wait_time = (2 ** attempt)
+                        await asyncio.sleep(wait_time)
+                        continue
+                    return None
+
+                ret_code = order.get("retCode")
+                ret_msg = order.get("retMsg", "Unknown error")
+
+                if ret_code == 0:
+                    return order
+
+                # Обработка специфических ошибок
+                if ret_code == 110017:  # "current position is zero"
+                    self.logger.warning(f"⚠️ Позиция еще не создана для {symbol}, попытка {attempt + 1}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1.0)  # Ждем дольше для этой ошибки
+                        continue
+
+                elif ret_code == 10001:  # Minimum size error
+                    current_qty = float(order_params['qty'])
+                    symbol_info = await self.get_symbol_info(symbol)
+                    min_qty = symbol_info['minOrderQty']
+
+                    if current_qty < min_qty:
+                        new_qty = min_qty * 1.1
+                        order_params['qty'] = str(round(new_qty, QTY_PRECISION.get(symbol, 3)))
+                        self.logger.warning(f"Adjusting qty from {current_qty} to {new_qty} for {symbol}")
+
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1)
+                            continue
+
+                elif ret_code in [10002, 10003]:  # Balance errors
+                    self.logger.error(f"Недостаточный баланс для {symbol}")
+                    await self.send_telegram(f"❌ {symbol} недостаточный баланс")
+                    break
+
+                else:
+                    self.logger.error(f"❌ Ошибка размещения ордера: код {ret_code}, сообщение: {ret_msg}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+
+                break
+
+            except Exception as e:
+                self.logger.error(f"Exception on attempt {attempt + 1} for {symbol}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+
+        return None
+
+    # ИСПРАВЛЕНИЕ 2: Исправленная функция place_order
     async def place_order(self, symbol: str, trade: dict):
-        """Размещение ордера с улучшенной обработкой ошибок"""
+        """Размещение ордера с ПРОСТЫМ решением"""
         try:
             direction = trade["signal"]
             sl = trade["sl"]
@@ -547,23 +569,46 @@ class TradingBot:
             self.logger.info(f"💰 Расчёт позиции: qty={qty}, entry={entry_price}, balance={self.start_balance}")
 
             # Формируем параметры ордера
-            order_params = {
-                'category': 'linear',
-                'symbol': symbol,
-                'side': 'Buy' if direction == 'BUY' else 'Sell',
-                'orderType': 'Market',
-                'qty': str(qty)
-            }
+            if symbol == "SOLUSDT":
+                safe_price = await self.get_safe_market_price(
+                    symbol,
+                    'Buy' if direction == 'BUY' else 'Sell',
+                    entry_price
+                )
+
+                if not safe_price:
+                    self.logger.error(f"❌ Не удалось получить безопасную цену для {symbol}")
+                    return
+
+                order_params = {
+                    'category': 'linear',
+                    'symbol': symbol,
+                    'side': 'Buy' if direction == 'BUY' else 'Sell',
+                    'orderType': 'Limit',
+                    'qty': str(qty),
+                    'price': str(safe_price),
+                    'timeInForce': 'IOC'
+                }
+
+                self.logger.info(f"💰 SOLUSDT лимитный ордер: entry={entry_price}, safe={safe_price}")
+            else:
+                order_params = {
+                    'category': 'linear',
+                    'symbol': symbol,
+                    'side': 'Buy' if direction == 'BUY' else 'Sell',
+                    'orderType': 'Market',
+                    'qty': str(qty)
+                }
 
             self.logger.info(f"📤 Отправка ордера: {order_params}")
 
-            # Размещаем ордер с повторными попытками
+            # Размещаем основной ордер
             order = await self.place_order_with_retry(order_params, symbol)
 
             if not order:
                 return
 
-            # Обрабатываем успешный ответ
+            # Получаем order_id
             result = order.get("result", {})
             order_id = result.get("orderId")
 
@@ -571,6 +616,25 @@ class TradingBot:
                 self.logger.error(f"❌ Не удалось получить order_id! Ответ: {order}")
                 await self.send_telegram(f"❌ {symbol} - Не получен ID ордера")
                 return
+
+            self.logger.info(f"✅ Order {order_id} placed successfully with qty {qty}")
+
+            # 🔥 ПРОСТОЕ РЕШЕНИЕ: Просто ждем 3-5 секунд
+            self.logger.info(f"⏳ Ожидание исполнения ордера {symbol}...")
+            await asyncio.sleep(3.0)  # Фиксированная задержка 3 секунды
+
+            # Дополнительная проверка позиции (опционально)
+            try:
+                positions = await self.connector.get_positions(symbol)
+                has_position = False
+                if positions and len(positions) > 0:
+                    has_position = any(float(pos.get('size', 0)) != 0 for pos in positions)
+
+                if not has_position:
+                    self.logger.warning(f"⚠️ Позиция не найдена для {symbol}, но продолжаем")
+                    # Не прерываем процесс, просто предупреждаем
+            except Exception as e:
+                self.logger.debug(f"Ошибка проверки позиции: {e}")
 
             # Сбрасываем счетчики ошибок при успехе
             if symbol in self.api_errors:
@@ -594,9 +658,7 @@ class TradingBot:
                 f"SL: {sl:.4f} | TP: {tp:.4f}"
             )
 
-            self.logger.info(f"✅ Order {order_id} placed successfully with qty {qty}")
-
-            # 🆕 ДОБАВЛЯЕМ: Размещаем защитные ордера сразу после успешного входа
+            # Теперь размещаем защитные ордера
             protective_success = await self.place_protective_orders(
                 symbol=symbol,
                 side=order_params['side'],
@@ -621,8 +683,78 @@ class TradingBot:
             self.failed_trades[symbol] = self.failed_trades.get(symbol, 0) + 1
             self.last_trade_time[symbol] = datetime.utcnow()
 
+    # ИСПРАВЛЕНИЕ 3: Улучшенная функция размещения защитных ордеров
+    async def place_protective_orders(self, symbol: str, side: str, entry_price: float, sl_price: float,
+                                      tp_price: float, qty: float):
+        """Размещает защитные ордера с дополнительными проверками"""
+        try:
+            # Определяем противоположную сторону для закрытия позиции
+            close_side = "Sell" if side == "Buy" else "Buy"
+
+            # Добавляем задержку для стабилизации позиции
+            await asyncio.sleep(1.0)
+
+            sl_success = False
+            tp_success = False
+
+            # 1. Размещаем стоп-лосс
+            try:
+                sl_order = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "side": close_side,
+                    "orderType": "Limit",
+                    "qty": str(qty),
+                    "price": str(sl_price),
+                    "reduceOnly": True,
+                    "timeInForce": "GTC"
+                }
+
+                # Используем больше попыток для защитных ордеров
+                sl_response = await self.place_order_with_retry(sl_order, symbol, max_retries=5)
+                if sl_response:
+                    self.logger.info(f"✅ Stop-Loss (Limit) размещен для {symbol}: {sl_price}")
+                    sl_success = True
+                else:
+                    self.logger.error(f"❌ Ошибка размещения Stop-Loss для {symbol}")
+
+            except Exception as e:
+                self.logger.error(f"❌ Исключение при размещении Stop-Loss для {symbol}: {e}")
+
+            # Пауза между ордерами
+            await asyncio.sleep(0.5)
+
+            # 2. Размещаем тейк-профит
+            try:
+                tp_order = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "side": close_side,
+                    "orderType": "Limit",
+                    "qty": str(qty),
+                    "price": str(tp_price),
+                    "reduceOnly": True,
+                    "timeInForce": "GTC"
+                }
+
+                tp_response = await self.place_order_with_retry(tp_order, symbol, max_retries=5)
+                if tp_response:
+                    self.logger.info(f"✅ Take-Profit (Limit) размещен для {symbol}: {tp_price}")
+                    tp_success = True
+                else:
+                    self.logger.error(f"❌ Ошибка размещения Take-Profit для {symbol}")
+
+            except Exception as e:
+                self.logger.error(f"❌ Исключение при размещении Take-Profit для {symbol}: {e}")
+
+            return sl_success and tp_success
+
+        except Exception as e:
+            self.logger.error(f"❌ Общая ошибка размещения защитных ордеров для {symbol}: {e}")
+            return False
+
     async def place_order_with_retry(self, order_params: dict, symbol: str, max_retries: int = 3) -> dict:
-        """Размещение ордера с повторными попытками и обработкой ошибок"""
+        """Размещение ордера с экспоненциальным бэкоффом"""
         for attempt in range(max_retries):
             try:
                 order = await self.connector.place_order(order_params)
@@ -632,14 +764,11 @@ class TradingBot:
                     error_count = self.api_errors[symbol]
 
                     self.logger.error(f"❌ Получен None ответ от Bybit для {symbol} (ошибка #{error_count})")
-                    await self.send_telegram(f"❌ {symbol} - Нет ответа от API (попытка #{error_count})")
-
-                    if error_count >= 5:
-                        self.last_trade_time[symbol] = datetime.utcnow()
-                        await self.send_telegram(f"🚫 {symbol} временно заблокирован из-за частых ошибок API")
 
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)
+                        # Экспоненциальная задержка: 1s, 2s, 4s
+                        wait_time = (2 ** attempt)
+                        await asyncio.sleep(wait_time)
                         continue
                     return None
 
@@ -650,13 +779,19 @@ class TradingBot:
                     return order
 
                 # Обработка специфических ошибок
-                if ret_code == 10001:  # Minimum size error
+                if ret_code == 110017:  # "current position is zero"
+                    self.logger.warning(f"⚠️ Позиция еще не создана для {symbol}, попытка {attempt + 1}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1.0)  # Ждем дольше для этой ошибки
+                        continue
+
+                elif ret_code == 10001:  # Minimum size error
                     current_qty = float(order_params['qty'])
                     symbol_info = await self.get_symbol_info(symbol)
                     min_qty = symbol_info['minOrderQty']
 
                     if current_qty < min_qty:
-                        new_qty = min_qty * 1.1  # Увеличиваем на 10%
+                        new_qty = min_qty * 1.1
                         order_params['qty'] = str(round(new_qty, QTY_PRECISION.get(symbol, 3)))
                         self.logger.warning(f"Adjusting qty from {current_qty} to {new_qty} for {symbol}")
 
@@ -669,18 +804,12 @@ class TradingBot:
                     await self.send_telegram(f"❌ {symbol} недостаточный баланс")
                     break
 
-                elif ret_code == 10004:  # Position limit
-                    self.logger.error(f"Лимит позиций достигнут для {symbol}")
-                    await self.send_telegram(f"❌ {symbol} лимит позиций достигнут")
-                    break
-
                 else:
                     self.logger.error(f"❌ Ошибка размещения ордера: код {ret_code}, сообщение: {ret_msg}")
-                    await self.send_telegram(f"❌ {symbol} ордер отклонён:\nКод: {ret_code}\nОшибка: {ret_msg}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
 
-                # Увеличиваем счетчик неудач для неисправимых ошибок
-                self.failed_trades[symbol] = self.failed_trades.get(symbol, 0) + 1
-                self.last_trade_time[symbol] = datetime.utcnow()
                 break
 
             except Exception as e:
