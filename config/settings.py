@@ -62,20 +62,22 @@ MODEL_DIR = BASE_DIR / "models"
 USE_AI = os.getenv("USE_AI", "false").lower() == "true"
 AI_MODEL_NAME = os.getenv("AI_MODEL_NAME", "lstm_volatility.h5")
 
+RISK_PERCENT = 1.5  # 1.5% риска на сделку
+
 # Минимальные количества для каждого символа
 MIN_QTY = {
     "BTCUSDT": 0.001,
     "ETHUSDT": 0.01,
     "XRPUSDT": 1.0,
-    "BNBUSDT": 0.001,    # ← ИСПРАВЛЕНО
-    "SOLUSDT": 0.001     # ← РЕКОМЕНДУЕТСЯ
+    "BNBUSDT": 0.01,    # ← ИСПРАВЛЕНО
+    "SOLUSDT": 0.01     # ← РЕКОМЕНДУЕТСЯ
 }
 
 QTY_PRECISION = {
     "BTCUSDT": 3,    # 0.001
     "ETHUSDT": 2,    # 0.01
     "XRPUSDT": 0,    # 1 (целое число)
-    "BNBUSDT": 3,    # 0.001 - ВАЖНО для исправления ошибки!
+    "BNBUSDT": 2,    # 0.001 - ВАЖНО для исправления ошибки!
     "SOLUSDT": 3     # 0.001
 }
 

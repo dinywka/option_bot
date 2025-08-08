@@ -150,6 +150,7 @@ import logging
 import asyncio
 import pandas as pd
 from pybit.unified_trading import HTTP
+from distutils.util import strtobool
 
 
 class BybitConnector:
@@ -158,8 +159,25 @@ class BybitConnector:
         self.session = HTTP(
             api_key=os.getenv("BYBIT_API_KEY"),
             api_secret=os.getenv("BYBIT_API_SECRET"),
-            testnet=os.getenv("BYBIT_DEMO") == "true"
+            testnet=bool(strtobool(os.getenv("BYBIT_DEMO", "false")))
         )
+
+    def set_trading_stop(self, symbol: str, stop_loss: float, take_profit: float, category: str = "linear"):
+        """ИСПРАВЛЕННАЯ функция установки SL/TP"""
+        try:
+            # Правильные параметры для pybit v5
+            response = self.session.set_trading_stop(
+                category=category,
+                symbol=symbol,
+                stopLoss=str(stop_loss),  # ✅ stopLoss (не stop_loss)
+                takeProfit=str(take_profit)  # ✅ takeProfit (не take_profit)
+            )
+
+            self.logger.info(f"🛡 set_trading_stop response for {symbol}: {response}")
+            return response
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка в set_trading_stop для {symbol}: {e}")
+            return {"retCode": -1, "retMsg": str(e)}
 
     async def run_blocking(self, func, *args, **kwargs):
         """Выполнение блокирующих операций с retry логикой"""
@@ -197,7 +215,6 @@ class BybitConnector:
                 limit=100
             )
 
-            # ИСПРАВЛЕНИЕ: Улучшенная обработка данных
             return self._process_data(resp, symbol)
 
         except Exception as e:
@@ -282,7 +299,7 @@ class BybitConnector:
             return None
 
     async def place_order(self, params):
-        """Размещение ордера с улучшенной валидацией"""
+        """ИСПРАВЛЕННАЯ функция размещения ордера"""
         try:
             # Проверяем обязательные параметры
             required = ['category', 'symbol', 'side', 'orderType', 'qty']
@@ -294,7 +311,27 @@ class BybitConnector:
             await asyncio.sleep(0.5)
 
             self.logger.info(f"📤 Отправка ордера на Bybit: {params}")
-            resp = await self.run_blocking(self.session.place_order, **params)
+
+            # 🔥 ВАЖНОЕ ИСПРАВЛЕНИЕ: Обрабатываем исключения из pybit
+            try:
+                resp = await self.run_blocking(self.session.place_order, **params)
+            except Exception as api_error:
+                # Извлекаем код ошибки из исключения pybit
+                error_msg = str(api_error)
+
+                # Парсим код ошибки из сообщения
+                import re
+                error_code_match = re.search(r'ErrCode:\s*(\d+)', error_msg)
+                error_code = int(error_code_match.group(1)) if error_code_match else None
+
+                # Создаем стандартный ответ для обработки
+                resp = {
+                    'retCode': error_code or -1,
+                    'retMsg': error_msg,
+                    'result': None
+                }
+
+                self.logger.error(f"❌ API исключение: {error_msg}")
 
             # Подробная проверка ответа
             if resp is None:
@@ -356,7 +393,6 @@ class BybitConnector:
                     return status
 
             # Если ордер не найден ни в активных, ни в истории, проверяем позиции
-            # Возможно, это маркет-ордер который мгновенно исполнился
             positions = await self.get_positions(symbol)
             if positions and len(positions) > 0:
                 for pos in positions:
@@ -445,7 +481,7 @@ class BybitConnector:
             return False
 
     async def get_positions(self, symbol: str = None):
-        """Получение текущих позиций с улучшенной обработкой"""
+        """ИСПРАВЛЕННАЯ функция получения позиций"""
         try:
             params = {"category": "linear"}
             if symbol:
@@ -462,13 +498,18 @@ class BybitConnector:
                 positions = response['result']['list']
                 self.logger.debug(f"📍 Найдено позиций: {len(positions)}")
 
-                # Фильтруем только позиции с размером > 0
+                # 🔥 ИСПРАВЛЕНИЕ: Правильная фильтрация позиций
                 active_positions = []
                 for pos in positions:
                     size = float(pos.get('size', 0))
-                    if size != 0:
+                    if abs(size) > 0:  # Используем abs() для учета коротких позиций
                         active_positions.append(pos)
-                        self.logger.info(f"📈 Активная позиция: {pos.get('symbol')} размер: {size}")
+                        side = pos.get('side', 'Unknown')
+                        unrealized_pnl = pos.get('unrealisedPnl', '0')
+                        self.logger.info(
+                            f"📈 Активная позиция: {pos.get('symbol')} "
+                            f"размер: {size} ({side}), PnL: {unrealized_pnl}"
+                        )
 
                 return active_positions
             return []
@@ -488,7 +529,7 @@ class BybitConnector:
             return False
 
     def _process_data(self, resp, symbol):
-        """Обработка данных свечей с улучшенной валидацией"""
+        """ИСПРАВЛЕННАЯ обработка данных свечей"""
         try:
             if not resp:
                 self.logger.error(f"❌ Пустой ответ для {symbol}")
@@ -515,7 +556,7 @@ class BybitConnector:
                 columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover']
             )
 
-            # ИСПРАВЛЕНИЕ: Проверяем, что DataFrame не пустой
+            # Проверяем, что DataFrame не пустой
             if df.empty:
                 self.logger.error(f"❌ DataFrame пустой для {symbol}")
                 return None
@@ -525,11 +566,15 @@ class BybitConnector:
             for col in numeric_cols:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-            # ИСПРАВЛЕНИЕ: Проверяем наличие NaN после конвертации
-            if df[numeric_cols].isnull().any().any():
-                self.logger.error(f"❌ Обнаружены NaN значения в данных для {symbol}")
+            # Проверяем наличие NaN после конвертации
+            nan_mask = df[numeric_cols].isnull()
+            if nan_mask.any().any():
+                self.logger.warning(f"⚠️ Обнаружены NaN значения в данных для {symbol}")
                 # Удаляем строки с NaN
+                before_count = len(df)
                 df = df.dropna(subset=numeric_cols)
+                after_count = len(df)
+                self.logger.info(f"📊 Удалено {before_count - after_count} строк с NaN для {symbol}")
 
             if df.empty:
                 self.logger.error(f"❌ DataFrame пустой после очистки NaN для {symbol}")
@@ -539,20 +584,34 @@ class BybitConnector:
             df['timestamp'] = pd.to_datetime(pd.to_numeric(df['timestamp']), unit='ms')
 
             # Сортируем по времени (от старых к новым)
-            df = df.sort_values('timestamp')
+            df = df.sort_values('timestamp').reset_index(drop=True)
 
-            # ИСПРАВЛЕНИЕ: Финальная проверка
+            # Финальная проверка
             if len(df) < 10:
                 self.logger.warning(f"⚠️ Слишком мало данных для {symbol}: {len(df)}")
+                return None
 
             result_df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].copy()
 
-            # Проверяем целостность данных
+            # Последняя проверка на NaN
             if result_df.isnull().any().any():
                 self.logger.error(f"❌ Финальный DataFrame содержит NaN для {symbol}")
                 return None
 
-            self.logger.debug(f"✅ Обработано {len(result_df)} свечей для {symbol}")
+            # Добавляем валидацию OHLC данных
+            invalid_ohlc = (
+                    (result_df['high'] < result_df['low']) |
+                    (result_df['open'] > result_df['high']) |
+                    (result_df['open'] < result_df['low']) |
+                    (result_df['close'] > result_df['high']) |
+                    (result_df['close'] < result_df['low'])
+            )
+
+            if invalid_ohlc.any():
+                self.logger.warning(f"⚠️ Обнаружены некорректные OHLC данные для {symbol}")
+                result_df = result_df[~invalid_ohlc].reset_index(drop=True)
+
+            self.logger.debug(f"✅ Обработано {len(result_df)} качественных свечей для {symbol}")
             return result_df
 
         except Exception as e:

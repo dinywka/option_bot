@@ -227,6 +227,12 @@ from connectors.bybit_connector import BybitConnector
 from strategies.enhanced_sr import EnhancedSRStrategy
 from config.settings import SYMBOLS, RISK_PERCENT, LEVERAGE, MIN_QTY, LOG_DIR, QTY_PRECISION
 
+import asyncio
+import logging
+import os
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from telegram import Bot
 
 
 class TradingBot:
@@ -242,13 +248,15 @@ class TradingBot:
         self.failed_trades = {}
         self.api_errors = {}
         self.start_balance = None
-        self.symbol_info = {}  # Кэш информации о символах
+        self.symbol_info = {}
+        self.emergency_stop = False
+        self.max_daily_loss = 0.05
+        self.daily_start_balance = None
+        self._last_pnl_report = {}
         self.setup_logging()
 
     def setup_logging(self):
         """Настройка логирования с ротацией файлов"""
-        from logging.handlers import RotatingFileHandler
-
         level = os.getenv("LOG_LEVEL", "INFO")
 
         # Создаем форматтер
@@ -275,6 +283,15 @@ class TradingBot:
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
 
+        # Добавляем обработчик для критических ошибок
+        critical_handler = logging.FileHandler('critical_errors.log')
+        critical_handler.setLevel(logging.ERROR)
+        critical_formatter = logging.Formatter(
+            '%(asctime)s - CRITICAL - %(name)s - %(levelname)s - %(message)s'
+        )
+        critical_handler.setFormatter(critical_formatter)
+        self.logger.addHandler(critical_handler)
+
     async def send_telegram(self, message: str):
         """Отправка сообщения в Telegram с обработкой ошибок"""
         try:
@@ -288,13 +305,18 @@ class TradingBot:
 
     async def get_account_balance(self) -> float:
         """Получение баланса аккаунта"""
-        balance = await self.connector.get_wallet_balance()
-        self.logger.info(f"Current balance: {balance}")
+        try:
+            balance = await self.connector.get_wallet_balance()
+            self.logger.info(f"💰 Current balance: {balance}")
 
-        if not balance or balance <= 0:
-            await self.send_telegram("⚠️ Внимание: нулевой баланс на счете!")
+            if not balance or balance <= 0:
+                await self.send_telegram("⚠️ Внимание: нулевой баланс на счете!")
+                return 0.0
 
-        return balance
+            return balance
+        except Exception as e:
+            self.logger.error(f"❌ Error getting balance: {e}")
+            return 0.0
 
     async def get_symbol_info(self, symbol: str) -> dict:
         """Получение информации о символе с кэшированием"""
@@ -305,117 +327,483 @@ class TradingBot:
             info = await self.connector.get_instruments_info(symbol)
             if info:
                 self.symbol_info[symbol] = info
-                self.logger.info(f"Loaded symbol info for {symbol}: {info}")
+                self.logger.info(f"📋 Loaded symbol info for {symbol}: {info}")
                 return info
         except Exception as e:
-            self.logger.error(f"Failed to get symbol info for {symbol}: {e}")
+            self.logger.error(f"❌ Failed to get symbol info for {symbol}: {e}")
 
         # Возвращаем дефолтные значения
         default_info = {
             'minOrderQty': MIN_QTY.get(symbol, 0.001),
+            'maxOrderQty': 1000.0,
             'qtyStep': 0.001,
             'minOrderAmt': 1.0,
             'tickSize': 0.01
         }
         self.symbol_info[symbol] = default_info
+        self.logger.warning(f"⚠️ Using default symbol info for {symbol}")
         return default_info
 
-    async def calculate_position_size(self, price: float, symbol: str) -> tuple[float, bool]:
-        """
-        Рассчитывает размер позиции с учетом минимальных требований
-        Возвращает: (quantity, is_valid)
-        """
+    async def calculate_position_size(self, entry_price: float, symbol: str) -> tuple[float, bool]:
+        """Расчет размера позиции с учетом ограничений"""
         try:
-            if not self.start_balance or self.start_balance <= 0:
-                self.logger.warning("Start balance is None or zero!")
+            # Получаем текущий баланс
+            balance = await self.get_account_balance()
+            if balance < 10:
+                self.logger.warning(f"❌ Недостаточный баланс для торговли: {balance}")
                 return 0.0, False
+
+            # Рассчитываем сумму риска (1% от баланса)
+            risk_amount = balance * 0.01
 
             # Получаем информацию о символе
             symbol_info = await self.get_symbol_info(symbol)
+
+            # Рассчитываем сырой размер позиции
+            raw_qty = risk_amount / entry_price
+
+            # Применяем ограничения символа
             min_qty = symbol_info['minOrderQty']
+            max_qty = symbol_info['maxOrderQty']
             qty_step = symbol_info['qtyStep']
-            min_notional = symbol_info.get('minOrderAmt', 1.0)
 
-            # Рассчитываем размер позиции (1.5% от баланса)
-            risk_amount = self.start_balance * (RISK_PERCENT / 100)
-            calculated_qty = risk_amount / price
+            # Округляем до валидного размера
+            adjusted_qty = max(min_qty, raw_qty)
+            adjusted_qty = round(adjusted_qty / qty_step) * qty_step
+            adjusted_qty = min(adjusted_qty, max_qty)
 
-            # Проверяем минимальную сумму ордера
-            if calculated_qty * price < min_notional:
-                calculated_qty = min_notional / price
-                self.logger.info(f"Adjusted qty to meet min notional: {calculated_qty}")
+            # Проверяем минимальную стоимость ордера
+            order_value = adjusted_qty * entry_price
+            min_order_amt = symbol_info.get('minOrderAmt', 1.0)
 
-            # Проверяем минимальное количество
-            if calculated_qty < min_qty:
-                calculated_qty = min_qty
-                self.logger.info(f"Adjusted qty to meet min quantity: {calculated_qty}")
-
-            # Округляем до нужного шага
-            precision = QTY_PRECISION.get(symbol, 3)
-
-            # Используем Decimal для точного округления
-            decimal_qty = Decimal(str(calculated_qty))
-            decimal_step = Decimal(str(qty_step))
-
-            # Округляем вниз до ближайшего шага
-            steps = decimal_qty / decimal_step
-            rounded_steps = steps.quantize(Decimal('1'), rounding=ROUND_DOWN)
-            final_qty = float(rounded_steps * decimal_step)
+            if order_value < min_order_amt:
+                adjusted_qty = min_order_amt / entry_price
+                adjusted_qty = round(adjusted_qty / qty_step) * qty_step
 
             # Финальная проверка
-            if final_qty < min_qty:
-                final_qty = min_qty
+            final_order_value = adjusted_qty * entry_price
+            max_order_value = balance * 0.02  # Не больше 2% баланса
 
-            # Проверяем, не превышает ли позиция 5% баланса (защита)
-            position_value = final_qty * price
-            if position_value > self.start_balance * 0.05:
-                self.logger.warning(f"Position too large: {position_value:.2f} > {self.start_balance * 0.05:.2f}")
+            if final_order_value > max_order_value:
+                self.logger.error(f"❌ Ордер слишком большой для {symbol}: {final_order_value} > {max_order_value}")
                 return 0.0, False
 
-            self.logger.info(f"Position calculation for {symbol}: "
-                             f"price={price:.4f}, risk_amount={risk_amount:.2f}, "
-                             f"calculated={calculated_qty:.6f}, final={final_qty:.6f}")
+            if adjusted_qty < min_qty:
+                self.logger.error(f"❌ Размер позиции меньше минимального: {adjusted_qty} < {min_qty}")
+                return 0.0, False
 
-            return final_qty, True
+            self.logger.info(
+                f"🔢 Расчет позиции {symbol}: сырой={raw_qty:.6f}, итоговый={adjusted_qty:.6f}, стоимость={final_order_value:.2f}")
+
+            return adjusted_qty, True
 
         except Exception as e:
-            self.logger.error(f"Position calculation error for {symbol}: {e}")
+            self.logger.error(f"❌ Error calculating position size for {symbol}: {e}")
             return 0.0, False
 
     async def can_trade(self, symbol: str) -> bool:
         """Проверяет возможность торговли символом"""
-        # Проверяем открытые позиции
-        if symbol in self.positions:
-            return False
-
-        # Проверяем ожидающие ордера
-        if symbol in self.pending_orders:
-            return False
-
-        # Проверяем cooldown с учетом неудачных сделок
-        last_time = self.last_trade_time.get(symbol)
-        if last_time:
-            failed_count = self.failed_trades.get(symbol, 0)
-            cooldown_minutes = 15 + (failed_count * 10)
-            cooldown_minutes = min(cooldown_minutes, 120)  # Максимум 2 часа
-
-            time_since = datetime.utcnow() - last_time
-            if time_since < timedelta(minutes=cooldown_minutes):
+        try:
+            # Проверяем аварийную остановку
+            if self.emergency_stop:
                 return False
 
-        # Проверяем частоту ошибок API
-        api_error_count = self.api_errors.get(symbol, 0)
-        if api_error_count >= 5:
-            # Блокируем символ на 1 час при частых ошибках API
-            if last_time and (datetime.utcnow() - last_time) < timedelta(hours=1):
+            # Проверяем открытые позиции
+            if symbol in self.positions:
+                self.logger.debug(f"❌ {symbol} уже в позициях")
                 return False
 
-        # Проверяем баланс
-        balance = await self.get_account_balance()
-        if balance < 10:
+            # Проверяем ожидающие ордера
+            if symbol in self.pending_orders:
+                self.logger.debug(f"❌ {symbol} имеет ожидающий ордер")
+                return False
+
+            # Проверяем cooldown с учетом неудачных сделок
+            last_time = self.last_trade_time.get(symbol)
+            if last_time:
+                failed_count = self.failed_trades.get(symbol, 0)
+                cooldown_minutes = 15 + (failed_count * 10)
+                cooldown_minutes = min(cooldown_minutes, 120)  # Максимум 2 часа
+
+                time_since = datetime.utcnow() - last_time
+                if time_since < timedelta(minutes=cooldown_minutes):
+                    self.logger.debug(f"❌ {symbol} в cooldown еще {cooldown_minutes - time_since.seconds // 60} мин")
+                    return False
+
+            # Проверяем частоту ошибок API
+            api_error_count = self.api_errors.get(symbol, 0)
+            if api_error_count >= 5:
+                if last_time and (datetime.utcnow() - last_time) < timedelta(hours=1):
+                    self.logger.debug(f"❌ {symbol} заблокирован из-за частых ошибок API")
+                    return False
+
+            # Проверяем баланс
+            balance = await self.get_account_balance()
+            if balance < 10:
+                self.logger.debug(f"❌ Недостаточный баланс: {balance}")
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"❌ Error in can_trade for {symbol}: {e}")
             return False
 
-        return True
+    async def place_order_with_retry(self, order_params: dict, symbol: str, max_retries: int = 3) -> dict:
+        """Размещение ордера с повторными попытками"""
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(f"📤 Попытка {attempt + 1}/{max_retries} размещения ордера {symbol}: {order_params}")
+
+                order = await self.connector.place_order(order_params)
+
+                if order is None:
+                    self.api_errors[symbol] = self.api_errors.get(symbol, 0) + 1
+                    self.logger.error(f"❌ Получен None ответ от Bybit для {symbol}")
+
+                    if attempt < max_retries - 1:
+                        wait_time = (2 ** attempt)
+                        await asyncio.sleep(wait_time)
+                        continue
+                    return None
+
+                ret_code = order.get("retCode")
+                ret_msg = order.get("retMsg", "Unknown error")
+
+                if ret_code == 0:
+                    self.logger.info(f"✅ Ордер успешно размещен для {symbol}")
+                    return order
+
+                # Обработка специфических ошибок
+                if ret_code == 110017:  # "current position is zero"
+                    self.logger.warning(f"⚠️ Позиция еще не создана для {symbol}, попытка {attempt + 1}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2.0)
+                        continue
+
+                elif ret_code == 10001:  # Minimum size error
+                    current_qty = float(order_params['qty'])
+                    symbol_info = await self.get_symbol_info(symbol)
+                    min_qty = symbol_info['minOrderQty']
+
+                    if current_qty < min_qty:
+                        new_qty = min_qty * 1.1
+                        order_params['qty'] = str(round(new_qty, 6))
+                        self.logger.warning(f"⚠️ Adjusting qty from {current_qty} to {new_qty} for {symbol}")
+
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1)
+                            continue
+
+                elif ret_code in [10002, 10003]:  # Balance errors
+                    self.logger.error(f"❌ Недостаточный баланс для {symbol}")
+                    await self.send_telegram(f"❌ {symbol} недостаточный баланс")
+                    break
+
+                self.logger.error(f"❌ Ошибка размещения ордера {symbol}: код {ret_code}, сообщение: {ret_msg}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+
+            except Exception as e:
+                self.logger.error(f"❌ Exception on attempt {attempt + 1} for {symbol}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+
+        return None
+
+    async def wait_for_position(self, symbol: str, expected_qty: float, timeout: int = 20) -> tuple[bool, float]:
+        """Ожидание создания позиции с контролем размера"""
+        self.logger.info(f"⏳ Ожидание создания позиции для {symbol} (ожидаем: {expected_qty})...")
+
+        for attempt in range(timeout):
+            try:
+                positions = await self.connector.get_positions(symbol)
+
+                if positions and len(positions) > 0:
+                    for pos in positions:
+                        pos_size = abs(float(pos.get('size', 0)))
+
+                        if pos_size > 0:
+                            # Контроль размера: если позиция больше чем в 2 раза - проблема
+                            if pos_size > expected_qty * 2:
+                                self.logger.error(
+                                    f"🚨 КРИТИЧНО! Размер позиции {symbol} превышен: "
+                                    f"ожидали {expected_qty}, получили {pos_size}"
+                                )
+                                await self.emergency_close_excess_position(symbol, expected_qty, pos_size)
+                                return True, expected_qty
+
+                            # Если размер в разумных пределах
+                            elif pos_size >= expected_qty * 0.8:  # 80% от ожидаемого
+                                self.logger.info(f"✅ Позиция создана для {symbol}: размер={pos_size}")
+                                return True, pos_size
+
+                            # Частичное исполнение
+                            elif pos_size > 0:
+                                self.logger.info(f"📊 Частичная позиция {symbol}: {pos_size}")
+                                if attempt >= timeout // 2:
+                                    return True, pos_size
+
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                self.logger.error(f"❌ Ошибка проверки позиции {symbol}: {e}")
+                await asyncio.sleep(1)
+
+        self.logger.warning(f"⚠️ Позиция не найдена для {symbol} за {timeout} секунд")
+        return False, 0.0
+
+    async def emergency_close_excess_position(self, symbol: str, expected_qty: float, actual_qty: float):
+        """Экстренное закрытие излишка позиции"""
+        try:
+            excess_qty = actual_qty - expected_qty
+            self.logger.warning(f"🚨 Экстренное закрытие излишка {symbol}: {excess_qty}")
+
+            positions = await self.connector.get_positions(symbol)
+            if not positions:
+                return
+
+            position = positions[0]
+            pos_side = position.get('side', '')
+            close_side = "Sell" if pos_side == "Buy" else "Buy"
+
+            close_params = {
+                "category": "linear",
+                "symbol": symbol,
+                "side": close_side,
+                "orderType": "Market",
+                "qty": str(round(excess_qty, 6)),
+                "reduceOnly": True
+            }
+
+            response = await self.connector.place_order(close_params)
+
+            if response and response.get("retCode") == 0:
+                self.logger.info(f"✅ Излишек {symbol} закрыт: {excess_qty}")
+                await self.send_telegram(f"🚨 Закрыт излишек позиции {symbol}: {excess_qty}")
+            else:
+                self.logger.error(f"❌ Не удалось закрыть излишек {symbol}: {response}")
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка экстренного закрытия {symbol}: {e}")
+
+    async def place_protective_orders(self, symbol: str, side: str, entry_price: float,
+                                      sl_price: float, tp_price: float, qty: float) -> bool:
+        """Установка защитных ордеров SL/TP"""
+        self.logger.info(f"🛡 Установка защитных ордеров для {symbol}: SL={sl_price}, TP={tp_price}")
+
+        try:
+            # Метод 1: Пытаемся использовать set_trading_stop
+            success = await self.set_trading_stop(symbol, sl_price, tp_price)
+            if success:
+                self.logger.info(f"✅ set_trading_stop успешно для {symbol}")
+                return True
+
+            # Метод 2: Fallback - используем reduce-only ордера
+            self.logger.info(f"🔄 Fallback: размещение reduce-only ордеров для {symbol}")
+            success = await self.place_reduce_only_orders(symbol, side, sl_price, tp_price, qty)
+
+            return success
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка установки защитных ордеров {symbol}: {e}")
+            return False
+
+    async def set_trading_stop(self, symbol: str, sl_price: float, tp_price: float, max_attempts: int = 3) -> bool:
+        """Установка SL/TP через set_trading_stop"""
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if attempt > 1:
+                    await asyncio.sleep(2)
+
+                result = await self.connector.set_trading_stop(
+                    symbol=symbol,
+                    stop_loss=sl_price,
+                    take_profit=tp_price,
+                    category="linear"
+                )
+
+                self.logger.info(f"🔁 Попытка {attempt}: set_trading_stop результат: {result}")
+
+                if result and result.get("retCode") == 0:
+                    self.logger.info(f"✅ set_trading_stop успешно для {symbol}")
+                    return True
+                elif result and "not modified" in str(result.get("retMsg", "")).lower():
+                    self.logger.info(f"ℹ️ SL/TP уже установлены для {symbol}")
+                    return True
+                else:
+                    error_msg = result.get("retMsg", "Unknown error") if result else "No response"
+                    self.logger.warning(f"⚠️ set_trading_stop попытка {attempt} неудачна: {error_msg}")
+
+            except Exception as e:
+                self.logger.error(f"❌ Исключение в set_trading_stop попытка {attempt}: {e}")
+
+        return False
+
+    async def place_reduce_only_orders(self, symbol: str, side: str, sl_price: float, tp_price: float,
+                                       qty: float) -> bool:
+        """Установка SL/TP через reduce-only ордера"""
+        try:
+            close_side = "Sell" if side == "Buy" else "Buy"
+            sl_success = False
+            tp_success = False
+
+            # Stop Loss ордер (StopMarket)
+            try:
+                sl_params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "side": close_side,
+                    "orderType": "StopMarket",
+                    "qty": str(qty),
+                    "stopPrice": str(sl_price),
+                    "reduceOnly": True,
+                    "timeInForce": "GTC"
+                }
+
+                sl_response = await self.connector.place_order(sl_params)
+                if sl_response and sl_response.get("retCode") == 0:
+                    sl_success = True
+                    self.logger.info(f"✅ SL ордер установлен для {symbol}")
+                else:
+                    self.logger.error(f"❌ Ошибка SL ордера: {sl_response}")
+
+            except Exception as e:
+                self.logger.error(f"❌ Исключение при размещении SL ордера: {e}")
+
+            # Take Profit ордер (Limit)
+            try:
+                tp_params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "side": close_side,
+                    "orderType": "Limit",
+                    "qty": str(qty),
+                    "price": str(tp_price),
+                    "reduceOnly": True,
+                    "timeInForce": "GTC"
+                }
+
+                tp_response = await self.connector.place_order(tp_params)
+                if tp_response and tp_response.get("retCode") == 0:
+                    tp_success = True
+                    self.logger.info(f"✅ TP ордер установлен для {symbol}")
+                else:
+                    self.logger.error(f"❌ Ошибка TP ордера: {tp_response}")
+
+            except Exception as e:
+                self.logger.error(f"❌ Исключение при размещении TP ордера: {e}")
+
+            success = sl_success or tp_success
+            if success:
+                self.logger.info(f"✅ Reduce-only ордера размещены для {symbol} (SL={sl_success}, TP={tp_success})")
+            else:
+                self.logger.error(f"❌ Не удалось разместить ни одного reduce-only ордера для {symbol}")
+
+            return success
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка в place_reduce_only_orders: {e}")
+            return False
+
+    async def place_order(self, symbol: str, trade: dict):
+        """Основная функция размещения ордера"""
+        try:
+            direction = trade["signal"]
+            sl = trade["sl"]
+            tp = trade["tp"]
+            entry_price = trade["entry"]
+
+            self.logger.info(f"🎯 Начинаем размещение ордера {symbol}: {direction} @ {entry_price}")
+
+            # 1. Проверяем баланс
+            current_balance = await self.get_account_balance()
+            if current_balance < 50:
+                self.logger.warning(f"❌ Недостаточный баланс для торговли: {current_balance}")
+                return
+
+            # 2. Рассчитываем размер позиции
+            qty, is_valid = await self.calculate_position_size(entry_price, symbol)
+            if not is_valid or qty <= 0:
+                self.logger.warning(f"❌ Неверное количество для {symbol}: {qty}")
+                return
+
+            # 3. Формируем параметры ордера
+            order_params = {
+                'category': 'linear',
+                'symbol': symbol,
+                'side': 'Buy' if direction == 'BUY' else 'Sell',
+                'orderType': 'Market',
+                'qty': str(qty)
+            }
+
+            # 4. Размещаем ордер
+            order = await self.place_order_with_retry(order_params, symbol)
+            if not order or order.get("retCode") != 0:
+                self.logger.error(f"❌ Ордер не размещен для {symbol}")
+                self.failed_trades[symbol] = self.failed_trades.get(symbol, 0) + 1
+                self.last_trade_time[symbol] = datetime.utcnow()
+                return
+
+            # 5. Получаем order_id
+            result = order.get("result", {})
+            order_id = result.get("orderId")
+            if not order_id:
+                self.logger.error(f"❌ Не получен order_id для {symbol}")
+                return
+
+            # 6. Ждем создания позиции
+            position_created, actual_qty = await self.wait_for_position(symbol, qty, timeout=15)
+            if not position_created:
+                self.logger.warning(f"⚠️ Позиция не создана для {symbol}")
+                await self.send_telegram(f"❌ {symbol} - позиция не создана")
+                return
+
+            self.logger.info(f"✅ Позиция {symbol} создана: {actual_qty}")
+
+            # 7. Размещаем защитные ордера
+            protective_success = await self.place_protective_orders(
+                symbol=symbol,
+                side=order_params['side'],
+                entry_price=entry_price,
+                sl_price=sl,
+                tp_price=tp,
+                qty=actual_qty
+            )
+
+            # 8. Добавляем в отслеживание
+            self.positions[symbol] = {
+                "entry_price": entry_price,
+                "sl": sl,
+                "tp": tp,
+                "side": direction,
+                "order_id": order_id,
+                "qty": actual_qty,
+                "created_at": datetime.utcnow(),
+                "protected": protective_success
+            }
+
+            # 9. Уведомления
+            protection_status = "🛡 Защищен" if protective_success else "⚠️ Не защищен"
+            await self.send_telegram(
+                f"✅ <b>{symbol} {direction}</b>\n"
+                f"Размер: {actual_qty}\n"
+                f"Цена: {entry_price:.4f}\n"
+                f"SL: {sl:.4f} | TP: {tp:.4f}\n"
+                f"Статус: {protection_status}"
+            )
+
+            # Сбрасываем счетчики ошибок при успехе
+            if symbol in self.api_errors:
+                del self.api_errors[symbol]
+            if symbol in self.failed_trades:
+                del self.failed_trades[symbol]
+
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка размещения ордера {symbol}: {e}")
+            await self.send_telegram(f"❌ {symbol} ошибка: {str(e)}")
+            self.failed_trades[symbol] = self.failed_trades.get(symbol, 0) + 1
+            self.last_trade_time[symbol] = datetime.utcnow()
 
     async def trading_cycle(self):
         """Основной торговый цикл"""
@@ -432,17 +820,8 @@ class TradingBot:
                 # Получаем данные
                 data = await self.connector.get_klines(symbol)
 
-                # ИСПРАВЛЕНИЕ: Правильная проверка DataFrame
-                if data is None:
-                    self.logger.warning(f"❌ Данные не получены для {symbol}")
-                    continue
-
-                if data.empty:  # Правильная проверка пустого DataFrame
-                    self.logger.warning(f"❌ Пустые данные для {symbol}")
-                    continue
-
-                if len(data) < 50:
-                    self.logger.warning(f"❌ Недостаточно данных для {symbol}: {len(data)}")
+                if data is None or data.empty or len(data) < 50:
+                    self.logger.warning(f"❌ Недостаточно данных для {symbol}")
                     continue
 
                 self.logger.debug(f"✅ Получено {len(data)} свечей для {symbol}")
@@ -451,7 +830,6 @@ class TradingBot:
                 strategy = EnhancedSRStrategy(data)
                 trade = strategy.generate_signal(data)
 
-                # ИСПРАВЛЕНИЕ: Правильная проверка результата стратегии
                 if trade is not None and isinstance(trade, dict) and trade.get('signal'):
                     self.logger.info(f"📊 Сигнал для {symbol}: {trade}")
                     await self.place_order(symbol, trade)
@@ -459,365 +837,118 @@ class TradingBot:
                     self.logger.debug(f"📊 Нет сигнала для {symbol}")
 
             except Exception as e:
-                self.logger.error(f"Trading cycle error for {symbol}: {e}")
-                # Увеличиваем счетчик ошибок API
+                self.logger.error(f"❌ Trading cycle error for {symbol}: {e}")
                 self.api_errors[symbol] = self.api_errors.get(symbol, 0) + 1
                 await asyncio.sleep(5)
 
-    async def get_safe_market_price(self, symbol: str, side: str, entry_price: float):
-        """Использует цену входа из сигнала с небольшим буфером для безопасности"""
-        try:
-            # Добавляем буфер для безопасности
-            if side == "Buy":
-                # Для покупки берем цену чуть выше цены входа
-                safe_price = entry_price * 1.002  # +0.2%
-            else:
-                # Для продажи берем цену чуть ниже цены входа
-                safe_price = entry_price * 0.998  # -0.2%
-
-            safe_price = round(safe_price, 2)  # Округляем до 2 знаков для SOL
-            self.logger.info(f"💰 Безопасная цена для {symbol} ({side}): {entry_price} → {safe_price}")
-            return safe_price
-
-        except Exception as e:
-            self.logger.error(f"❌ Ошибка расчета безопасной цены для {symbol}: {e}")
-            return None
-
-    # ИСПРАВЛЕНИЕ 4: Улучшенная функция place_order_with_retry (ИДЕТ ПЕРВОЙ)
-    async def place_order_with_retry(self, order_params: dict, symbol: str, max_retries: int = 3) -> dict:
-        """Размещение ордера с экспоненциальным бэкоффом"""
-        for attempt in range(max_retries):
+    async def check_positions(self):
+        """Проверка активных позиций"""
+        for symbol, pos in list(self.positions.items()):
             try:
-                order = await self.connector.place_order(order_params)
+                # Получаем текущую цену
+                price_data = await self.connector.get_last_price(symbol)
+                if not price_data:
+                    continue
 
-                if order is None:
-                    self.api_errors[symbol] = self.api_errors.get(symbol, 0) + 1
-                    error_count = self.api_errors[symbol]
+                current_price = float(price_data['last_price'])
+                direction = pos["side"]
+                entry_price = pos["entry_price"]
+                sl_price = pos["sl"]
+                tp_price = pos["tp"]
 
-                    self.logger.error(f"❌ Получен None ответ от Bybit для {symbol} (ошибка #{error_count})")
+                # Проверяем SL/TP
+                sl_hit, tp_hit = self.check_sl_tp_hit(current_price, direction, sl_price, tp_price)
 
-                    if attempt < max_retries - 1:
-                        # Экспоненциальная задержка: 1s, 2s, 4s
-                        wait_time = (2 ** attempt)
-                        await asyncio.sleep(wait_time)
-                        continue
-                    return None
-
-                ret_code = order.get("retCode")
-                ret_msg = order.get("retMsg", "Unknown error")
-
-                if ret_code == 0:
-                    return order
-
-                # Обработка специфических ошибок
-                if ret_code == 110017:  # "current position is zero"
-                    self.logger.warning(f"⚠️ Позиция еще не создана для {symbol}, попытка {attempt + 1}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(1.0)  # Ждем дольше для этой ошибки
-                        continue
-
-                elif ret_code == 10001:  # Minimum size error
-                    current_qty = float(order_params['qty'])
-                    symbol_info = await self.get_symbol_info(symbol)
-                    min_qty = symbol_info['minOrderQty']
-
-                    if current_qty < min_qty:
-                        new_qty = min_qty * 1.1
-                        order_params['qty'] = str(round(new_qty, QTY_PRECISION.get(symbol, 3)))
-                        self.logger.warning(f"Adjusting qty from {current_qty} to {new_qty} for {symbol}")
-
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(1)
-                            continue
-
-                elif ret_code in [10002, 10003]:  # Balance errors
-                    self.logger.error(f"Недостаточный баланс для {symbol}")
-                    await self.send_telegram(f"❌ {symbol} недостаточный баланс")
-                    break
-
+                if sl_hit:
+                    await self.handle_sl_hit(symbol, pos, current_price, entry_price, direction)
+                elif tp_hit:
+                    await self.handle_tp_hit(symbol, pos, current_price, entry_price, direction)
                 else:
-                    self.logger.error(f"❌ Ошибка размещения ордера: код {ret_code}, сообщение: {ret_msg}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-
-                break
+                    # Периодический отчет о PnL
+                    await self.report_pnl(symbol, pos, current_price, entry_price, direction)
 
             except Exception as e:
-                self.logger.error(f"Exception on attempt {attempt + 1} for {symbol}: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
+                self.logger.error(f"❌ Position check error for {symbol}: {e}")
 
-        return None
+    def check_sl_tp_hit(self, current_price: float, direction: str, sl_price: float, tp_price: float) -> tuple[
+        bool, bool]:
+        """Проверка срабатывания SL/TP"""
+        if direction == "BUY":
+            sl_hit = current_price <= sl_price
+            tp_hit = current_price >= tp_price
+        else:  # SELL
+            sl_hit = current_price >= sl_price
+            tp_hit = current_price <= tp_price
 
-    # ИСПРАВЛЕНИЕ 2: Исправленная функция place_order
-    async def place_order(self, symbol: str, trade: dict):
-        """Размещение ордера с ПРОСТЫМ решением"""
-        try:
-            direction = trade["signal"]
-            sl = trade["sl"]
-            tp = trade["tp"]
-            entry_price = trade["entry"]
+        return sl_hit, tp_hit
 
-            # Рассчитываем размер позиции
-            qty, is_valid = await self.calculate_position_size(entry_price, symbol)
+    async def handle_sl_hit(self, symbol: str, pos: dict, current_price: float, entry_price: float, direction: str):
+        """Обработка срабатывания Stop Loss"""
+        pnl_pct = self.calculate_pnl_pct(current_price, entry_price, direction)
 
-            if not is_valid or qty <= 0:
-                self.logger.warning(f"❌ Нулевое количество для {symbol}: {qty}")
-                return
+        await self.send_telegram(
+            f"❌ <b>{symbol}</b> SL HIT!\n"
+            f"Entry: {entry_price:.4f} → Exit: {current_price:.4f}\n"
+            f"PnL: {pnl_pct:+.2f}%\n"
+            f"Direction: {direction}"
+        )
 
-            self.logger.info(f"💰 Расчёт позиции: qty={qty}, entry={entry_price}, balance={self.start_balance}")
+        # Увеличиваем счетчик неудач
+        self.failed_trades[symbol] = self.failed_trades.get(symbol, 0) + 1
+        self.last_trade_time[symbol] = datetime.utcnow()
 
-            # Формируем параметры ордера
-            if symbol == "SOLUSDT":
-                safe_price = await self.get_safe_market_price(
-                    symbol,
-                    'Buy' if direction == 'BUY' else 'Sell',
-                    entry_price
-                )
+        failed_count = self.failed_trades[symbol]
+        cooldown_minutes = 15 + (failed_count * 10)
 
-                if not safe_price:
-                    self.logger.error(f"❌ Не удалось получить безопасную цену для {symbol}")
-                    return
+        await self.send_telegram(
+            f"🔒 {symbol} blocked for {cooldown_minutes} min\n"
+            f"Failed trades: {failed_count}"
+        )
 
-                order_params = {
-                    'category': 'linear',
-                    'symbol': symbol,
-                    'side': 'Buy' if direction == 'BUY' else 'Sell',
-                    'orderType': 'Limit',
-                    'qty': str(qty),
-                    'price': str(safe_price),
-                    'timeInForce': 'IOC'
-                }
+        del self.positions[symbol]
 
-                self.logger.info(f"💰 SOLUSDT лимитный ордер: entry={entry_price}, safe={safe_price}")
-            else:
-                order_params = {
-                    'category': 'linear',
-                    'symbol': symbol,
-                    'side': 'Buy' if direction == 'BUY' else 'Sell',
-                    'orderType': 'Market',
-                    'qty': str(qty)
-                }
+    async def handle_tp_hit(self, symbol: str, pos: dict, current_price: float, entry_price: float, direction: str):
+        """Обработка срабатывания Take Profit"""
+        pnl_pct = self.calculate_pnl_pct(current_price, entry_price, direction)
 
-            self.logger.info(f"📤 Отправка ордера: {order_params}")
+        await self.send_telegram(
+            f"✅ <b>{symbol}</b> TP HIT!\n"
+            f"Entry: {entry_price:.4f} → Exit: {current_price:.4f}\n"
+            f"PnL: {pnl_pct:+.2f}%\n"
+            f"Direction: {direction}"
+        )
 
-            # Размещаем основной ордер
-            order = await self.place_order_with_retry(order_params, symbol)
+        # Сбрасываем счетчик неудач
+        if symbol in self.failed_trades:
+            del self.failed_trades[symbol]
+            await self.send_telegram(f"🎯 {symbol} - failed series reset!")
 
-            if not order:
-                return
+        del self.positions[symbol]
 
-            # Получаем order_id
-            result = order.get("result", {})
-            order_id = result.get("orderId")
+    def calculate_pnl_pct(self, current_price: float, entry_price: float, direction: str) -> float:
+        """Расчет PnL в процентах"""
+        if direction == "BUY":
+            return ((current_price - entry_price) / entry_price) * 100
+        else:  # SELL
+            return ((entry_price - current_price) / entry_price) * 100
 
-            if not order_id:
-                self.logger.error(f"❌ Не удалось получить order_id! Ответ: {order}")
-                await self.send_telegram(f"❌ {symbol} - Не получен ID ордера")
-                return
+    async def report_pnl(self, symbol: str, pos: dict, current_price: float, entry_price: float, direction: str):
+        """Периодический отчет о PnL"""
+        # Отчет только каждые 10 минут
+        last_report = self._last_pnl_report.get(symbol)
+        if last_report and (datetime.utcnow() - last_report).seconds < 600:
+            return
 
-            self.logger.info(f"✅ Order {order_id} placed successfully with qty {qty}")
+        pnl_pct = self.calculate_pnl_pct(current_price, entry_price, direction)
+        balance = await self.get_account_balance()
 
-            # 🔥 ПРОСТОЕ РЕШЕНИЕ: Просто ждем 3-5 секунд
-            self.logger.info(f"⏳ Ожидание исполнения ордера {symbol}...")
-            await asyncio.sleep(3.0)  # Фиксированная задержка 3 секунды
+        await self.send_telegram(
+            f"📊 <b>{symbol}</b> PnL: {pnl_pct:+.2f}%\n"
+            f"Entry: {entry_price:.4f} → Now: {current_price:.4f}\n"
+            f"💰 Balance: {balance:.2f} USDT"
+        )
 
-            # Дополнительная проверка позиции (опционально)
-            try:
-                positions = await self.connector.get_positions(symbol)
-                has_position = False
-                if positions and len(positions) > 0:
-                    has_position = any(float(pos.get('size', 0)) != 0 for pos in positions)
-
-                if not has_position:
-                    self.logger.warning(f"⚠️ Позиция не найдена для {symbol}, но продолжаем")
-                    # Не прерываем процесс, просто предупреждаем
-            except Exception as e:
-                self.logger.debug(f"Ошибка проверки позиции: {e}")
-
-            # Сбрасываем счетчики ошибок при успехе
-            if symbol in self.api_errors:
-                del self.api_errors[symbol]
-
-            # Добавляем в ожидающие ордера
-            self.pending_orders[symbol] = {
-                "order_id": order_id,
-                "trade": trade,
-                "direction": direction,
-                "qty": qty,
-                "attempts": 0,
-                "created_at": datetime.utcnow()
-            }
-
-            await self.send_telegram(
-                f"📤 <b>{symbol} {direction}</b> order placed\n"
-                f"ID: {order_id}\n"
-                f"Qty: {qty}\n"
-                f"Entry: {entry_price:.4f}\n"
-                f"SL: {sl:.4f} | TP: {tp:.4f}"
-            )
-
-            # Теперь размещаем защитные ордера
-            protective_success = await self.place_protective_orders(
-                symbol=symbol,
-                side=order_params['side'],
-                entry_price=entry_price,
-                sl_price=sl,
-                tp_price=tp,
-                qty=qty
-            )
-
-            if protective_success:
-                self.logger.info(f"🛡 Защитные ордера размещены для {symbol}")
-                await self.send_telegram(f"🛡 <b>{symbol}</b> - Stop-Loss и Take-Profit размещены")
-            else:
-                self.logger.warning(f"⚠️ Не удалось разместить защитные ордера для {symbol}")
-                await self.send_telegram(f"⚠️ <b>{symbol}</b> - Ошибка размещения защитных ордеров")
-
-        except Exception as e:
-            self.logger.error(f"Order placement error for {symbol}: {e}")
-            await self.send_telegram(f"❌ {symbol} order error: {str(e)}")
-
-            # Увеличиваем счетчик неудач
-            self.failed_trades[symbol] = self.failed_trades.get(symbol, 0) + 1
-            self.last_trade_time[symbol] = datetime.utcnow()
-
-    # ИСПРАВЛЕНИЕ 3: Улучшенная функция размещения защитных ордеров
-    async def place_protective_orders(self, symbol: str, side: str, entry_price: float, sl_price: float,
-                                      tp_price: float, qty: float):
-        """Размещает защитные ордера с дополнительными проверками"""
-        try:
-            # Определяем противоположную сторону для закрытия позиции
-            close_side = "Sell" if side == "Buy" else "Buy"
-
-            # Добавляем задержку для стабилизации позиции
-            await asyncio.sleep(1.0)
-
-            sl_success = False
-            tp_success = False
-
-            # 1. Размещаем стоп-лосс
-            try:
-                sl_order = {
-                    "category": "linear",
-                    "symbol": symbol,
-                    "side": close_side,
-                    "orderType": "Limit",
-                    "qty": str(qty),
-                    "price": str(sl_price),
-                    "reduceOnly": True,
-                    "timeInForce": "GTC"
-                }
-
-                # Используем больше попыток для защитных ордеров
-                sl_response = await self.place_order_with_retry(sl_order, symbol, max_retries=5)
-                if sl_response:
-                    self.logger.info(f"✅ Stop-Loss (Limit) размещен для {symbol}: {sl_price}")
-                    sl_success = True
-                else:
-                    self.logger.error(f"❌ Ошибка размещения Stop-Loss для {symbol}")
-
-            except Exception as e:
-                self.logger.error(f"❌ Исключение при размещении Stop-Loss для {symbol}: {e}")
-
-            # Пауза между ордерами
-            await asyncio.sleep(0.5)
-
-            # 2. Размещаем тейк-профит
-            try:
-                tp_order = {
-                    "category": "linear",
-                    "symbol": symbol,
-                    "side": close_side,
-                    "orderType": "Limit",
-                    "qty": str(qty),
-                    "price": str(tp_price),
-                    "reduceOnly": True,
-                    "timeInForce": "GTC"
-                }
-
-                tp_response = await self.place_order_with_retry(tp_order, symbol, max_retries=5)
-                if tp_response:
-                    self.logger.info(f"✅ Take-Profit (Limit) размещен для {symbol}: {tp_price}")
-                    tp_success = True
-                else:
-                    self.logger.error(f"❌ Ошибка размещения Take-Profit для {symbol}")
-
-            except Exception as e:
-                self.logger.error(f"❌ Исключение при размещении Take-Profit для {symbol}: {e}")
-
-            return sl_success and tp_success
-
-        except Exception as e:
-            self.logger.error(f"❌ Общая ошибка размещения защитных ордеров для {symbol}: {e}")
-            return False
-
-    async def place_order_with_retry(self, order_params: dict, symbol: str, max_retries: int = 3) -> dict:
-        """Размещение ордера с экспоненциальным бэкоффом"""
-        for attempt in range(max_retries):
-            try:
-                order = await self.connector.place_order(order_params)
-
-                if order is None:
-                    self.api_errors[symbol] = self.api_errors.get(symbol, 0) + 1
-                    error_count = self.api_errors[symbol]
-
-                    self.logger.error(f"❌ Получен None ответ от Bybit для {symbol} (ошибка #{error_count})")
-
-                    if attempt < max_retries - 1:
-                        # Экспоненциальная задержка: 1s, 2s, 4s
-                        wait_time = (2 ** attempt)
-                        await asyncio.sleep(wait_time)
-                        continue
-                    return None
-
-                ret_code = order.get("retCode")
-                ret_msg = order.get("retMsg", "Unknown error")
-
-                if ret_code == 0:
-                    return order
-
-                # Обработка специфических ошибок
-                if ret_code == 110017:  # "current position is zero"
-                    self.logger.warning(f"⚠️ Позиция еще не создана для {symbol}, попытка {attempt + 1}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(1.0)  # Ждем дольше для этой ошибки
-                        continue
-
-                elif ret_code == 10001:  # Minimum size error
-                    current_qty = float(order_params['qty'])
-                    symbol_info = await self.get_symbol_info(symbol)
-                    min_qty = symbol_info['minOrderQty']
-
-                    if current_qty < min_qty:
-                        new_qty = min_qty * 1.1
-                        order_params['qty'] = str(round(new_qty, QTY_PRECISION.get(symbol, 3)))
-                        self.logger.warning(f"Adjusting qty from {current_qty} to {new_qty} for {symbol}")
-
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(1)
-                            continue
-
-                elif ret_code in [10002, 10003]:  # Balance errors
-                    self.logger.error(f"Недостаточный баланс для {symbol}")
-                    await self.send_telegram(f"❌ {symbol} недостаточный баланс")
-                    break
-
-                else:
-                    self.logger.error(f"❌ Ошибка размещения ордера: код {ret_code}, сообщение: {ret_msg}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-
-                break
-
-            except Exception as e:
-                self.logger.error(f"Exception on attempt {attempt + 1} for {symbol}: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-
-        return None
+        self._last_pnl_report[symbol] = datetime.utcnow()
 
     async def check_pending_orders(self):
         """Проверка статуса ожидающих ордеров"""
@@ -830,29 +961,23 @@ class TradingBot:
                 # Получаем статус ордера
                 status = await self.connector.get_order_status(symbol, order_id)
 
-                self.logger.debug(f"Order {order_id} status: {status} (attempt {pending['attempts']})")
+                self.logger.debug(f"📋 Order {order_id} status: {status} (attempt {pending['attempts']})")
 
                 if status == "Filled":
-                    # Ордер исполнен
-                    await self._handle_filled_order(symbol, pending)
-
+                    await self.handle_filled_order(symbol, pending)
                 elif status in ["Cancelled", "Rejected", "Expired"]:
-                    # Ордер отменен
-                    await self._handle_cancelled_order(symbol, pending, status)
-
+                    await self.handle_cancelled_order(symbol, pending, status)
                 elif status in ["Unknown", None]:
-                    # Неопределенный статус - проверяем через позиции
-                    await self._handle_unknown_status(symbol, pending)
-
+                    await self.handle_unknown_status(symbol, pending)
                 elif pending["attempts"] > 20:  # Таймаут
-                    await self._handle_timeout_order(symbol, pending)
+                    await self.handle_timeout_order(symbol, pending)
 
             except Exception as e:
-                self.logger.error(f"Pending order check error for {symbol}: {e}")
+                self.logger.error(f"❌ Pending order check error for {symbol}: {e}")
                 if symbol in self.pending_orders:
                     self.pending_orders[symbol]["attempts"] += 1
 
-    async def _handle_filled_order(self, symbol: str, pending: dict):
+    async def handle_filled_order(self, symbol: str, pending: dict):
         """Обработка исполненного ордера"""
         trade = pending["trade"]
         order_id = pending["order_id"]
@@ -877,7 +1002,21 @@ class TradingBot:
             f"Qty: {pending['qty']}"
         )
 
-    async def _handle_cancelled_order(self, symbol: str, pending: dict, status: str):
+        protective_success = await self.place_protective_orders(
+            symbol=symbol,
+            side='Buy' if pending["direction"] == 'BUY' else 'Sell',
+            entry_price=trade["entry"],
+            sl_price=trade["sl"],
+            tp_price=trade["tp"],
+            qty=pending["qty"]
+        )
+
+        if protective_success:
+            await self.send_telegram(f"🛡 <b>{symbol}</b> - Защитные ордера размещены")
+        else:
+            await self.send_telegram(f"⚠️ <b>{symbol}</b> - Ошибка размещения защитных ордеров")
+
+    async def handle_cancelled_order(self, symbol: str, pending: dict, status: str):
         """Обработка отмененного ордера"""
         order_id = pending["order_id"]
         del self.pending_orders[symbol]
@@ -887,7 +1026,7 @@ class TradingBot:
             f"ID: {order_id}"
         )
 
-    async def _handle_unknown_status(self, symbol: str, pending: dict):
+    async def handle_unknown_status(self, symbol: str, pending: dict):
         """Обработка неопределенного статуса"""
         order_id = pending["order_id"]
 
@@ -896,12 +1035,11 @@ class TradingBot:
             positions = await self.connector.get_positions(symbol)
             has_position = False
 
-            # ИСПРАВЛЕНИЕ: Правильная проверка позиций
             if positions and len(positions) > 0:
                 has_position = any(float(pos.get('size', 0)) != 0 for pos in positions)
 
             if has_position:
-                await self._handle_filled_order(symbol, pending)
+                await self.handle_filled_order(symbol, pending)
             elif pending["attempts"] > 10:
                 # Прекращаем отслеживание
                 del self.pending_orders[symbol]
@@ -911,9 +1049,9 @@ class TradingBot:
                     f"Status unclear after {pending['attempts']} checks"
                 )
         except Exception as e:
-            self.logger.error(f"Error checking positions for {symbol}: {e}")
+            self.logger.error(f"❌ Error checking positions for {symbol}: {e}")
 
-    async def _handle_timeout_order(self, symbol: str, pending: dict):
+    async def handle_timeout_order(self, symbol: str, pending: dict):
         """Обработка ордера по таймауту"""
         order_id = pending["order_id"]
 
@@ -928,162 +1066,82 @@ class TradingBot:
                 f"Cancellation: {'✅' if cancel_result else '❌'}"
             )
         except Exception as e:
-            self.logger.error(f"Error cancelling order {order_id}: {e}")
+            self.logger.error(f"❌ Error cancelling order {order_id}: {e}")
 
-    async def check_positions(self):
-        """Проверка активных позиций"""
-        for symbol, pos in list(self.positions.items()):
-            try:
-                # Получаем текущую цену
-                price_data = await self.connector.get_last_price(symbol)
-                if not price_data:
-                    continue
+    async def check_emergency_conditions(self):
+        """Проверка аварийных условий"""
+        try:
+            current_balance = await self.get_account_balance()
 
-                current_price = float(price_data['last_price'])
-                direction = pos["side"]
-                entry_price = pos["entry_price"]
-                sl_price = pos["sl"]
-                tp_price = pos["tp"]
+            if self.daily_start_balance is None:
+                self.daily_start_balance = current_balance
+                return
 
-                # Проверяем SL/TP
-                sl_hit, tp_hit = self._check_sl_tp(current_price, direction, sl_price, tp_price)
+            # Проверяем дневную просадку
+            daily_loss_pct = (self.daily_start_balance - current_balance) / self.daily_start_balance
 
-                if sl_hit:
-                    await self._handle_sl_hit(symbol, pos, current_price, entry_price, direction)
-                elif tp_hit:
-                    await self._handle_tp_hit(symbol, pos, current_price, entry_price, direction)
-                else:
-                    # Периодический отчет о PnL
-                    await self._report_pnl(symbol, pos, current_price, entry_price, direction)
+            if daily_loss_pct >= self.max_daily_loss:
+                self.emergency_stop = True
+                self.logger.critical(f"🚨 АВАРИЙНАЯ ОСТАНОВКА! Дневная просадка: {daily_loss_pct:.2%}")
 
-            except Exception as e:
-                self.logger.error(f"Position check error for {symbol}: {e}")
+                await self.send_telegram(
+                    f"🚨 <b>АВАРИЙНАЯ ОСТАНОВКА!</b>\n"
+                    f"Дневная просадка: {daily_loss_pct:.2%}\n"
+                    f"Начальный баланс: {self.daily_start_balance:.2f}\n"
+                    f"Текущий баланс: {current_balance:.2f}\n"
+                    f"Бот остановлен до завтра"
+                )
 
-    def _check_sl_tp(self, current_price: float, direction: str, sl_price: float, tp_price: float) -> tuple[bool, bool]:
-        """Проверка срабатывания SL/TP"""
-        if direction == "BUY":
-            sl_hit = current_price <= sl_price
-            tp_hit = current_price >= tp_price
-        else:  # SELL
-            sl_hit = current_price >= sl_price
-            tp_hit = current_price <= tp_price
+                # Закрываем все открытые позиции
+                await self.close_all_positions()
 
-        return sl_hit, tp_hit
+        except Exception as e:
+            self.logger.error(f"❌ Error checking emergency conditions: {e}")
 
-    async def _handle_sl_hit(self, symbol: str, pos: dict, current_price: float, entry_price: float, direction: str):
-        """Обработка срабатывания Stop Loss"""
-        pnl_pct = self._calculate_pnl_pct(current_price, entry_price, direction)
+    async def close_all_positions(self):
+        """Закрытие всех открытых позиций"""
+        try:
+            for symbol in list(self.positions.keys()):
+                try:
+                    positions = await self.connector.get_positions(symbol)
+                    if not positions:
+                        continue
 
-        await self.send_telegram(
-            f"❌ <b>{symbol}</b> SL HIT!\n"
-            f"Entry: {entry_price:.4f} → Exit: {current_price:.4f}\n"
-            f"PnL: {pnl_pct:+.2f}%\n"
-            f"Direction: {direction}"
-        )
+                    for pos in positions:
+                        pos_size = float(pos.get('size', 0))
+                        if pos_size == 0:
+                            continue
 
-        # Увеличиваем счетчик неудач
-        self.failed_trades[symbol] = self.failed_trades.get(symbol, 0) + 1
-        self.last_trade_time[symbol] = datetime.utcnow()
+                        pos_side = pos.get('side', '')
+                        close_side = "Sell" if pos_side == "Buy" else "Buy"
 
-        failed_count = self.failed_trades[symbol]
-        cooldown_minutes = 15 + (failed_count * 10)
+                        close_params = {
+                            "category": "linear",
+                            "symbol": symbol,
+                            "side": close_side,
+                            "orderType": "Market",
+                            "qty": str(abs(pos_size)),
+                            "reduceOnly": True
+                        }
 
-        await self.send_telegram(
-            f"🔒 {symbol} blocked for {cooldown_minutes} min\n"
-            f"Failed trades: {failed_count}"
-        )
+                        response = await self.connector.place_order(close_params)
 
-        del self.positions[symbol]
+                        if response and response.get("retCode") == 0:
+                            self.logger.info(f"🚨 Аварийно закрыта позиция {symbol}")
+                            await self.send_telegram(f"🚨 Закрыта позиция {symbol}")
+                        else:
+                            self.logger.error(f"❌ Не удалось закрыть позицию {symbol}: {response}")
 
-    async def _handle_tp_hit(self, symbol: str, pos: dict, current_price: float, entry_price: float, direction: str):
-        """Обработка срабатывания Take Profit"""
-        pnl_pct = self._calculate_pnl_pct(current_price, entry_price, direction)
+                except Exception as e:
+                    self.logger.error(f"❌ Error closing position {symbol}: {e}")
 
-        await self.send_telegram(
-            f"✅ <b>{symbol}</b> TP HIT!\n"
-            f"Entry: {entry_price:.4f} → Exit: {current_price:.4f}\n"
-            f"PnL: {pnl_pct:+.2f}%\n"
-            f"Direction: {direction}"
-        )
+            # Очищаем все позиции из отслеживания
+            self.positions.clear()
 
-        # Сбрасываем счетчик неудач
-        if symbol in self.failed_trades:
-            del self.failed_trades[symbol]
-            await self.send_telegram(f"🎯 {symbol} - failed series reset!")
+        except Exception as e:
+            self.logger.error(f"❌ Error in close_all_positions: {e}")
 
-        del self.positions[symbol]
-
-    def _calculate_pnl_pct(self, current_price: float, entry_price: float, direction: str) -> float:
-        """Расчет PnL в процентах"""
-        if direction == "BUY":
-            return ((current_price - entry_price) / entry_price) * 100
-        else:  # SELL
-            return ((entry_price - current_price) / entry_price) * 100
-
-    async def _report_pnl(self, symbol: str, pos: dict, current_price: float, entry_price: float, direction: str):
-        """Периодический отчет о PnL"""
-        # Отчет только каждые 10 минут
-        if not hasattr(self, '_last_pnl_report'):
-            self._last_pnl_report = {}
-
-        last_report = self._last_pnl_report.get(symbol)
-        if last_report and (datetime.utcnow() - last_report).seconds < 600:
-            return
-
-        pnl_pct = self._calculate_pnl_pct(current_price, entry_price, direction)
-        balance = await self.get_account_balance()
-
-        await self.send_telegram(
-            f"📊 <b>{symbol}</b> PnL: {pnl_pct:+.2f}%\n"
-            f"Entry: {entry_price:.4f} → Now: {current_price:.4f}\n"
-            f"💰 Balance: {balance:.2f} USDT"
-        )
-
-        self._last_pnl_report[symbol] = datetime.utcnow()
-
-    async def run(self):
-        """Главный цикл бота"""
-        await self.send_telegram("🤖 Bot started")
-
-        # Получаем начальный баланс
-        self.start_balance = await self.get_account_balance()
-
-        if not self.start_balance or self.start_balance <= 0:
-            await self.send_telegram("❌ Critical error: zero balance!")
-            return
-
-        cycle_count = 0
-
-        while True:
-            try:
-                cycle_count += 1
-                self.logger.info(f"=== Cycle {cycle_count} ===")
-
-                # 1. Проверяем ожидающие ордера
-                await self.check_pending_orders()
-
-                # 2. Проверяем активные позиции
-                await self.check_positions()
-
-                # 3. Ищем новые торговые возможности
-                await self.trading_cycle()
-
-                # Периодический отчет
-                if cycle_count % 15 == 0:  # Каждые 15 минут
-                    await self._send_status_report(cycle_count)
-
-                # Обновляем баланс каждые 30 циклов
-                if cycle_count % 30 == 0:
-                    self.start_balance = await self.get_account_balance()
-
-                await asyncio.sleep(60)  # 1 минута между циклами
-
-            except Exception as e:
-                self.logger.error(f"Main loop error: {e}")
-                await self.send_telegram(f"⚠️ Main loop error: {str(e)}")
-                await asyncio.sleep(30)
-
-    async def _send_status_report(self, cycle_count: int):
+    async def send_status_report(self, cycle_count: int):
         """Отправка статуса бота"""
         try:
             total_api_errors = sum(self.api_errors.values())
@@ -1100,10 +1158,100 @@ class TradingBot:
                 f"• Pending orders: {len(self.pending_orders)}\n"
                 f"• Blocked symbols: {blocked_symbols}\n"
                 f"• API errors: {total_api_errors}\n"
+                f"• Emergency stop: {'🔴 YES' if self.emergency_stop else '🟢 NO'}\n"
                 f"• Balance: {current_balance:.2f} USDT ({balance_change:+.2f}%)"
             )
+
         except Exception as e:
-            self.logger.error(f"Status report error: {e}")
+            self.logger.error(f"❌ Status report error: {e}")
+
+    async def reset_daily_counters(self):
+        """Сброс дневных счетчиков (вызывать раз в день)"""
+        try:
+            current_time = datetime.utcnow()
+
+            # Проверяем, нужно ли сбросить дневные счетчики (новый день)
+            if not hasattr(self, '_last_reset_date'):
+                self._last_reset_date = current_time.date()
+                return
+
+            if current_time.date() > self._last_reset_date:
+                self.daily_start_balance = await self.get_account_balance()
+                self.emergency_stop = False
+                self._last_reset_date = current_time.date()
+
+                self.logger.info(f"🔄 Дневные счетчики сброшены. Новый стартовый баланс: {self.daily_start_balance}")
+                await self.send_telegram(
+                    f"🌅 Новый торговый день!\n"
+                    f"Стартовый баланс: {self.daily_start_balance:.2f} USDT\n"
+                    f"Аварийная остановка сброшена"
+                )
+
+        except Exception as e:
+            self.logger.error(f"❌ Error resetting daily counters: {e}")
+
+    async def run(self):
+        """Главный цикл бота"""
+        self.logger.info("🤖 Bot started")
+        await self.send_telegram("🤖 Bot started")
+
+        # Получаем начальный баланс
+        self.start_balance = await self.get_account_balance()
+        self.daily_start_balance = self.start_balance
+
+        if not self.start_balance or self.start_balance <= 0:
+            await self.send_telegram("❌ Critical error: zero balance!")
+            self.logger.critical("❌ Критическая ошибка: нулевой баланс!")
+            return
+
+        self.logger.info(f"💰 Стартовый баланс: {self.start_balance}")
+
+        cycle_count = 0
+
+        while True:
+            try:
+                cycle_count += 1
+                self.logger.info(f"=== Cycle {cycle_count} ===")
+
+                # 1. Проверяем дневные счетчики
+                await self.reset_daily_counters()
+
+                # 2. Проверяем аварийные условия
+                await self.check_emergency_conditions()
+
+                # Если аварийная остановка - пропускаем торговлю
+                if self.emergency_stop:
+                    self.logger.info("🚨 Аварийная остановка активна, торговля приостановлена")
+                    await asyncio.sleep(300)  # 5 минут
+                    continue
+
+                # 3. Проверяем ожидающие ордера
+                await self.check_pending_orders()
+
+                # 4. Проверяем активные позиции
+                await self.check_positions()
+
+                # 5. Ищем новые торговые возможности
+                await self.trading_cycle()
+
+                # Периодический отчет
+                if cycle_count % 15 == 0:  # Каждые 15 минут
+                    await self.send_status_report(cycle_count)
+
+                # Обновляем баланс каждые 30 циклов
+                if cycle_count % 30 == 0:
+                    self.start_balance = await self.get_account_balance()
+
+                await asyncio.sleep(60)  # 1 минута между циклами
+
+            except KeyboardInterrupt:
+                self.logger.info("🛑 Bot stopped by user")
+                await self.send_telegram("🛑 Bot stopped by user")
+                break
+            except Exception as e:
+                self.logger.error(f"❌ Main loop error: {e}")
+                await self.send_telegram(f"⚠️ Main loop error: {str(e)}")
+                await asyncio.sleep(30)
 
 
 if __name__ == "__main__":
@@ -1111,6 +1259,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
-        bot.logger.info("Bot stopped by user")
+        bot.logger.info("🛑 Bot stopped by user")
     except Exception as e:
-        bot.logger.critical(f"Fatal error: {e}")
+        bot.logger.critical(f"💥 Fatal error: {e}")

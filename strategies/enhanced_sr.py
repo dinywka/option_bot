@@ -518,7 +518,8 @@ class EnhancedSRStrategy:
             sl_distance = abs(current_price - sr_levels['support']) / current_price
 
             # SL не ближе 0.5% и не дальше 3%
-            sl_distance = max(0.005, min(sl_distance, 0.03))
+            # 🔥 ИСПРАВЛЕНИЕ: Увеличиваем минимальные расстояния
+            sl_distance = max(0.008, min(sl_distance, 0.04))  # Минимум 0.8%, максимум 4%
             sl_price = current_price * (1 - sl_distance)
 
             # TP на основе risk/reward ratio 1:2
@@ -545,7 +546,8 @@ class EnhancedSRStrategy:
             sl_distance = abs(sr_levels['resistance'] - current_price) / current_price
 
             # SL не ближе 0.5% и не дальше 3%
-            sl_distance = max(0.005, min(sl_distance, 0.03))
+            # 🔥 ИСПРАВЛЕНИЕ: Увеличиваем минимальные расстояния
+            sl_distance = max(0.008, min(sl_distance, 0.04))  # Минимум 0.8%, максимум 4%
             sl_price = current_price * (1 + sl_distance)
 
             # TP на основе risk/reward ratio 1:2
